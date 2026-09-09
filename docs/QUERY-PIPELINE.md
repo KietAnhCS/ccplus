@@ -107,6 +107,7 @@
 - [57. Chẩn đoán sự cố](#57-chẩn-đoán-sự-cố)
 - [58. Thuật ngữ](#58-thuật-ngữ)
 - [59. Toàn cảnh một trang](#59-toàn-cảnh-một-trang)
+- [60. Cây gọi đầy đủ kèm file và số dòng](#60-cây-gọi-đầy-đủ-kèm-file-và-số-dòng)
 
 ---
 ---
@@ -2669,6 +2670,226 @@ NotNode.evaluateAgainst(…) → đường ĐÚNG, luôn trừ trên một tập
   ↳ phủ định độc lập sẽ trả về gần như TOÀN BỘ corpus — đúng về mặt tập hợp,
     vô dụng về mặt tìm kiếm, và tốn bộ nhớ đúng bằng cỡ corpus
 ```
+
+---
+
+## 60. Cây gọi đầy đủ kèm file và số dòng
+
+> Bảng tra nhanh ở [mục 55](#55-bảng-tra-nhanh-khối--file--hàm) trả lời câu hỏi
+> "khối này nằm ở file nào". Mục này trả lời câu hỏi ngược lại và chi tiết hơn:
+> **một request đi qua đúng những dòng nào, theo đúng thứ tự nào.** Mỗi nhánh
+> ghi `đường-dẫn-file:dòng → Class.method`. Số dòng ứng với mã nguồn tại thời
+> điểm viết tài liệu; tên hàm mới là thứ bền, số dòng chỉ để nhảy nhanh.
+
+Ba gốc đường dẫn dùng trong cây:
+
+| Viết tắt trong cây | Đường dẫn đầy đủ |
+|---|---|
+| *(mặc định)* | `backend/java/libs/core-search/src/main/java/com/vnsearch/` |
+| `search-service/` | `backend/java/services/search-service/src/main/java/com/vnsearch/` |
+| `core-common/` | `backend/java/libs/core-common/src/main/java/com/vnsearch/` |
+
+```
+GET /api/search?q=…&page=1&size=10
+
+├─ search-service/controller/SearchController.java
+│  :43  @GetMapping("/search")
+│  :44  SearchController.search(q, page, size)
+│  :47  safePage = min(max(page,1), SearchController.MAX_PAGE=1_000)      (:31)
+│  :48  safeSize = (size<1 || size>MAX_SIZE=100) ? DEFAULT_SIZE=20 : size (:34,:35)
+│  :49  → SearchEngineFacade.search(q, safePage, safeSize)
+│
+└─ service/SearchEngineFacade.java
+   :281  SearchEngineFacade.search(rawQuery, page, size)                  ★ ĐIỂM VÀO
+   │
+   ├─ :282  start = System.currentTimeMillis()
+   ├─ :283  normalizedQuery = rawQuery == null ? "" : rawQuery.trim()
+   │
+   ├─ 🔒 CHỤP 4 TRƯỜNG volatile VÀO BIẾN CỤC BỘ                     (:287–:294)
+   │  ├─ :112 SearchEngineFacade.searchCache    → :287 `cache`
+   │  │        ghi bởi SearchEngineFacade.init()                 (:134)
+   │  │                SearchEngineFacade.refreshDerivedState()  (:253)
+   │  ├─ :108 SearchEngineFacade.index          → :288 `currentIndex`
+   │  │        ghi bởi constructor (:129), init() (:139), loadCorpus() (:163,:192),
+   │  │                startCrawl() lambda (:350), reindex() (:405)
+   │  ├─ :111 SearchEngineFacade.scorer         → :289 `currentScorer`
+   │  │        ghi bởi refreshDerivedState() (:251  ScorerFactory.create)
+   │  └─ :110 SearchEngineFacade.pageRankScores → :294 `currentPageRank`
+   │           ghi bởi refreshDerivedState() (:248  PageRankService.computePageRank)
+   │  ↳ cả 4 bị ghi lại bởi refreshDerivedState(), gọi từ reindex() (:407) và
+   │    lambda startCrawl() (:352) trên LUỒNG KHÁC → đọc thẳng trường sẽ ghép
+   │    chỉ mục CŨ với PageRank MỚI, và ghi kết quả cũ vào cache MỚI ở :330
+   │
+   ├─ :296  cacheKey = normalizedQuery.toLowerCase(Locale.ROOT) + "|p"+page + "|s"+size
+   ├─ :297  core-common/datastructure/LRUCache.java:75
+   │        LRUCache.get(cacheKey) → :78 map.get, :82 LRUCache.moveToFront (:142)
+   │        └─ khác null → :299 cacheHits.incrementAndGet() và TRẢ NGAY
+   ├─ :302  cacheMisses.incrementAndGet()
+   │
+   ├─ :304  query/QueryParser.java:79
+   │        QueryParser.parse(normalizedQuery)                     ─── PHÂN TÍCH
+   │  ├─ Bước 1 (:84–:99) cắt cụm ngoặc kép RA KHỎI chuỗi
+   │  │  ├─ :42  QueryParser.PHRASE_PATTERN = "\"([^\"]*)\""
+   │  │  ├─ :92  Matcher.find → :93 remaining.append(phần NGOÀI ngoặc)
+   │  │  │                     → :95 phrasesRaw.add(matcher.group(1))
+   │  │  └─ :99  remaining.append(phần đuôi)
+   │  │     ↳ không cắt thì tiếng trong cụm vừa là phrase vừa là mustTerm →
+   │  │       CandidateResolver.buildQueryTermFrequency (:265) đếm hai lần
+   │  ├─ Bước 2 (:101–:146) quét từng từ của `remaining`
+   │  │  ├─ :114 startsWith(QueryParser.SITE_PREFIX="site:" :44) → :117 siteFilter
+   │  │  ├─ :123 QueryParser.OR_KEYWORD="OR" (:43) → gom dãy OR liên tiếp (:131)
+   │  │  │       thành MỘT nhóm → :137 orGroupsRaw.add(group)
+   │  │  ├─ :142 word.startsWith("-")  → excludedRaw.add(word.substring(1))
+   │  │  └─ :144 còn lại              → mustRaw.add(word)
+   │  ├─ Bước 3 (:148–:176) QueryParser.tokenizeToTerms (:219)
+   │  │        → VietnameseTokenizer.tokenize — CÙNG tokenizer với tầng chỉ mục
+   │  │          (bất biến đặt ở SearchEngineFacade constructor :127)
+   │  │  ├─ :152 mustTerms     = tokenizeToTerms(String.join(" ", mustRaw))     CHUNG
+   │  │  ├─ :153 excludedTerms = tokenizeToTerms(String.join(" ", excludedRaw)) CHUNG
+   │  │  │       ↳ nối lại rồi tokenize để Longest Matching đủ ngữ cảnh ghép từ ghép
+   │  │  ├─ :157 mỗi cụm ngoặc kép: tokenizeToTerms RIÊNG (đơn vị độc lập)
+   │  │  ├─ :167 mỗi vế OR: tokenizeToTerms rồi alternatives.addAll
+   │  │  └─ :173 alternatives.size()==1 → mustTerms.add (OR một vế thành AND)
+   │  └─ :176 → QueryParser.ParsedQuery (record :65)
+   │            (mustTerms, phrases, excludedTerms, orGroups, siteFilter)
+   │
+   ├─ :307  query/CandidateResolver.java:90
+   │        CandidateResolver.resolve(currentIndex, parsed)          ─── TRUY HỒI
+   │  │     (static — không phải instance; :308 resolved.candidateDocIds())
+   │  ├─ :91  CandidateResolver.buildQueryTermFrequency(parsed)           (:265)
+   │  │        gộp mustTerms (:267) + term của phrases (:270) + term của orGroups (:275)
+   │  │        ↳ luôn tính từ truy vấn GỐC, kể cả khi nới lỏng
+   │  ├─ :94  CandidateResolver.AST_BUILDER (:61, QueryParser riêng không tokenizer)
+   │  │        → QueryParser.buildAst(parsed) (:194)                 (Composite)
+   │  │  ├─ :198 new TermNode(term)       cho mỗi mustTerm
+   │  │  ├─ :201 new PhraseNode(phrase)   cho mỗi cụm
+   │  │  ├─ :208 new OrNode(alternatives) cho mỗi nhóm OR
+   │  │  ├─ :211 children rỗng → return null
+   │  │  │       → CandidateResolver.resolve :95 trả ResolvedQuery rỗng NGAY
+   │  │  ├─ :214 new NotNode(new TermNode(excluded)) — thêm SAU khi đã chốt :211
+   │  │  └─ :216 return new AndNode(children)
+   │  │
+   │  ├─ :99  ast.evaluate(index)                        ─── GIAI ĐOẠN 1
+   │  │  └─ query/ast/AndNode.java:30  AndNode.evaluate(index)
+   │  │     ├─ :38  tách children: `child instanceof NotNode` → negatives / positives
+   │  │     ├─ :44  positives.isEmpty() → :45 UnsupportedOperationException
+   │  │     │        ("AND chỉ gồm NOT thì không đánh giá được")
+   │  │     ├─ :50  positives.sort(Comparator.comparingInt(QueryNode::estimatedSize))
+   │  │     │        ← SHORTEST-FIRST
+   │  │     │  ├─ query/ast/TermNode.java:23   TermNode.estimatedSize
+   │  │     │  │     = SearchIndex.getDocumentFrequency(term), O(1)           (:24)
+   │  │     │  ├─ query/ast/PhraseNode.java:43 PhraseNode.estimatedSize
+   │  │     │  │     = min getDocumentFrequency của các tiếng                 (:46)
+   │  │     │  ├─ query/ast/OrNode.java:32     OrNode.estimatedSize
+   │  │     │  │     = tổng con (chặn trên, đủ để sort ở AndNode cha)         (:37)
+   │  │     │  └─ query/ast/NotNode.java:61    NotNode.estimatedSize
+   │  │     │        = SearchIndex.getTotalDocs — bị AndNode.estimatedSize bỏ qua (:73)
+   │  │     ├─ :52  accumulator = positives.get(0).evaluate(index)   ← con NHỎ NHẤT
+   │  │     │  ├─ TermNode.java:18   TermNode.evaluate
+   │  │     │  │     → query/PostingListMerger.java:54 PostingListMerger.docIdsOf(
+   │  │     │  │       SearchIndex.getPostings(term))
+   │  │     │  ├─ OrNode.java:23     OrNode.evaluate
+   │  │     │  │     → PostingListMerger.java:86 PostingListMerger.union, two-pointer O(m+n)
+   │  │     │  └─ PhraseNode.java:23 PhraseNode.evaluate
+   │  │     │     ├─ :31 new AndNode(asTerms).evaluate(index)           ← lọc THÔ
+   │  │     │     └─ :35 ∀ docId: PostingListMerger.matchesPhrase       ← lọc CHÍNH XÁC
+   │  │     │           PostingListMerger.java:207
+   │  │     │           ├─ :214 SearchIndex.getPositions(term_i, docId) — lấy MỘT lần,
+   │  │     │           │        ngoài vòng lặp; length==0 → return false
+   │  │     │           └─ :229 Arrays.binarySearch(positionsByTerm[i], start + i) < 0
+   │  │     │                    (nhị phân trên dãy vị trí đã tăng dần, không quét
+   │  │     │                     tuyến tính, không mở hộp Integer)
+   │  │     ├─ :57  ∀ positives còn lại: PostingListMerger.intersect (PLM:63)
+   │  │     │        :55 accumulator.isEmpty() → return List.of()
+   │  │     │        (rỗng là phần tử HẤP THỤ của phép giao)
+   │  │     └─ :64  ∀ negatives: NotNode.evaluateAgainst(accumulator, index)
+   │  │              NotNode.java:40 — hai con trỏ, j chỉ tiến một chiều → O(m+n)
+   │  │              (NotNode.evaluate :25 ném UnsupportedOperationException;
+   │  │               evaluateAgainst mới là đường dùng thật)
+   │  │
+   │  ├─ :99  CandidateResolver.applyFilters(candidates, index, parsed)   (:113)
+   │  │  │     (Chain of Responsibility — CandidateResolver.FILTERS :57)
+   │  │  ├─ :117 candidates.isEmpty() → break cả chuỗi (rỗng là phần tử hấp thụ)
+   │  │  ├─ :58  query/filter/DomainFilter.java
+   │  │  │       ├─ :30 DomainFilter.isApplicable → parsed.siteFilter() != null
+   │  │  │       ├─ :35 DomainFilter.apply → :43 DomainFilter.hostOf(doc.getUrl())
+   │  │  │       │       :51 hostOf → URI.create(url).getHost() (:56), bỏ tiền tố "www."
+   │  │  │       │       giữ doc khi host.equals(wanted) || host.endsWith("."+wanted)
+   │  │  │       └─ :68 DomainFilter.name() = "site"
+   │  │  └─ :59  query/filter/MaxCandidatesFilter.java
+   │  │          ├─ :29 MaxCandidatesFilter.DEFAULT_MAX_CANDIDATES = 10_000
+   │  │          ├─ :45 isApplicable → luôn true
+   │  │          ├─ :50 apply → size<=max thì trả nguyên (không cấp phát),
+   │  │          │       ngược lại :54 List.copyOf(subList(0, maxCandidates))
+   │  │          └─ :58 name() = "max-candidates"
+   │  │
+   │  └─ :105 rỗng → CandidateResolver.relaxAndRetry    ─── GIAI ĐOẠN 2 (nới lỏng)
+   │     │     :156
+   │     ├─ :158 mustTerms rỗng → trả ResolvedQuery rỗng
+   │     ├─ :165 CandidateResolver.isUnmatchable(index, parsed)           (:232)
+   │     │        ├─ :234 phrase có tiếng getDocumentFrequency == 0 → true
+   │     │        └─ :242 orGroup không vế nào df > 0 → true
+   │     │        ↳ thoát ngay, khỏi thử k lần vô ích
+   │     ├─ Bước 1 :173 remaining.removeIf(getDocumentFrequency(term)==0)
+   │     │          bỏ TẤT CẢ term df=0 trong MỘT lần → :181 CandidateResolver.attempt
+   │     ├─ Bước 2 :189 remaining.sort(comparingInt(index::getDocumentFrequency).reversed())
+   │     │          → :191 dropped.add(remaining.remove(0)) — bỏ term PHỔ BIẾN nhất trước
+   │     │          → :192 attempt; vòng lặp dừng khi remaining.size()==1 (:190)
+   │     ├─ CandidateResolver.attempt (:206)
+   │     │  ├─ :208 dựng ParsedQuery rút gọn — GIỮ NGUYÊN phrases, excludedTerms,
+   │     │  │        orGroups, siteFilter (chỉ mustTerms bị rút)
+   │     │  ├─ :213 AST_BUILDER.buildAst(relaxed) → null thì :215 return null
+   │     │  ├─ :217 ast.evaluate + applyFilters → rỗng thì :219 return null
+   │     │  └─ :222 new ResolvedQuery(candidates, queryTermFrequency, List.copyOf(dropped))
+   │     └─ droppedTerms nằm trong CandidateResolver.ResolvedQuery (record :76,
+   │        wasRelaxed :85) → trả ra ngoài cho người dùng, KHÔNG bỏ qua âm thầm
+   │        ↳ điểm vẫn chấm theo queryTermFrequency GỐC: khớp 4/5 term vẫn trên 3/5
+   │
+   ├─ :310  topN = Math.max(page * size, size)
+   ├─ :311  ranking/ResultRanker.java:88
+   │        ResultRanker.rank(candidates, resolved.queryTermFrequency(), currentIndex,
+   │                          currentScorer, currentPageRank, topN)    ─── XẾP HẠNG
+   │  ├─ GĐ 0 :97  RelevanceScorer.prepare(queryTermFrequency, index)
+   │  │              → DocumentScorer (idf + trọng số truy vấn tính MỘT lần)
+   │  ├─ GĐ 1 :100–:109  ∀ docId: SearchIndex.getDocument, pageRankScores.getOrDefault,
+   │  │              DocumentScorer.score(docId) → ResultRanker.ScoredCandidate (:73)
+   │  ├─ GĐ 2 :112  MinHeap.topK(scored, topN, comparingDouble(ScoredCandidate::finalScore))
+   │  │              O(c log K) thay vì O(c log c)
+   │  └─ GĐ 3 :116–:130  CHỈ top-K mới sinh snippet:
+   │              QuerySyllables.from(queryTermFrequency.keySet()) (:116)
+   │              SnippetBuilder.build(SearchIndex.getBodyText(docId), syllables) (:128)
+   │              → ResultRanker.RankedResult (record :68)
+   │        (công thức BM25 + Decorator PageRank/title: docs/RANKING-PIPELINE.md)
+   │
+   ├─ :315  fromIndex = min((max(page,1) − 1) * size, ranked.size())
+   ├─ :316  toIndex   = min(fromIndex + size, ranked.size())
+   ├─ :318  ∀ ResultRanker.RankedResult trong subList(fromIndex, toIndex)
+   │        → new SearchResult(document.getTitle(), getUrl(), snippet(),
+   │                           finalScore(), pageRankScore(), getCrawledAt())
+   ├─ :324  elapsed = System.currentTimeMillis() − start
+   ├─ :327  new SearchResponse(normalizedQuery, candidates.size(), page,
+   │                           size ĐÃ ÁP DỤNG, elapsed, pageResults,
+   │                           resolved.droppedTerms())
+   ├─ :330  LRUCache.put(cacheKey, response)   (LRUCache.java:90 — :96 moveToFront
+   │        nếu khoá đã có, :100 map.put rồi đẩy lên đầu, quá capacity thì loại đuôi)
+   └─ :334  candidates không rỗng →
+            service/SuggestionService.java:106 SuggestionService.learnFromQuery(normalizedQuery)
+            └─ :110 SuggestionService.insertBothForms(query.trim().toLowerCase, 1) (:120)
+               ├─ :121 Trie.insert(phrase, phrase, frequency)
+               └─ :122 VietnameseTokenizer.stripDiacritics → :125 Trie.insert bản không dấu
+                        (trỏ về CÙNG chuỗi hiển thị có dấu)
+            ↳ chỉ học từ truy vấn CÓ kết quả, để không học phải lỗi chính tả
+```
+
+### 60.1 Năm chỗ dễ đọc nhầm khi dò theo cây
+
+| Đọc nhầm thường gặp | Sự thật trong mã |
+|---|---|
+| `CandidateResolver.resolve` là phương thức của một bean | `static` — `CandidateResolver.java:90`, constructor `private` (:64) |
+| Cây AST dựng bằng `queryParser` của Facade | Dựng bằng `CandidateResolver.AST_BUILDER` (:61) — một `QueryParser` riêng, **không** tokenizer |
+| `NotNode.evaluate` là đường loại trừ | `NotNode.evaluate` (:25) luôn ném `UnsupportedOperationException`; đường thật là `NotNode.evaluateAgainst` (:40) |
+| `matchesPhrase` quét tuyến tính mảng vị trí | `Arrays.binarySearch(positionsByTerm[i], start + i)` — `PostingListMerger.java:229` |
+| `buildAst` thêm `NotNode` rồi mới kiểm tra rỗng | Kiểm tra `children.isEmpty()` ở `:211` xảy ra **trước** khi thêm `NotNode` ở `:214` — nên truy vấn chỉ toàn `-từ` trả `null`, không bao giờ chạm tới `AndNode` |
 
 ---
 
